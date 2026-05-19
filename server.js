@@ -1,32 +1,21 @@
+const fs = require('fs/promises');
 const path = require('path');
 const express = require('express');
 const helmet = require('helmet');
 const session = require('express-session');
-const pgSession = require('connect-pg-simple')(session);
 const bcrypt = require('bcryptjs');
-const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-change-me';
-const DATABASE_URL = process.env.DATABASE_URL;
-
-if (!DATABASE_URL) {
-  console.error('Missing DATABASE_URL. Add a PostgreSQL database on Railway or set DATABASE_URL locally.');
-  process.exit(1);
-}
-
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1') ? false : { rejectUnauthorized: false }
-});
+const DATA_DIR = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
+const DATA_FILE = process.env.DATA_FILE || path.join(DATA_DIR, 'crate-rush-data.json');
 
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(session({
-  store: new pgSession({ pool, createTableIfMissing: true }),
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
@@ -121,6 +110,86 @@ const ACHIEVEMENTS = [
   { id: 'fake-rich', icon: '💰', title: 'Fake-Money Flex', description: 'Reach a $10,000 total value.', reward: 1500, check: s => Number(s.balance) + Number(s.inventory_value) >= 10000 }
 ];
 
+function defaultData() {
+  return {
+    meta: {
+      version: 1,
+      created_at: new Date().toISOString(),
+      storage: 'json-file'
+    },
+    next_user_id: 1,
+    next_history_id: 1,
+    users: [],
+    inventory_items: [],
+    history: [],
+    claimed_achievements: [],
+    trades: [],
+    trade_items: []
+  };
+}
+
+class JsonStore {
+  constructor(filePath) {
+    this.filePath = filePath;
+    this.data = null;
+    this.ready = false;
+    this.lock = Promise.resolve();
+  }
+
+  async init() {
+    if (this.ready) return;
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    try {
+      const raw = await fs.readFile(this.filePath, 'utf8');
+      this.data = JSON.parse(raw);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        console.warn('Could not read data file, creating a new one:', error.message);
+      }
+      this.data = defaultData();
+      await this.save();
+    }
+    this.normalize();
+    await this.save();
+    this.ready = true;
+  }
+
+  normalize() {
+    const base = defaultData();
+    this.data = { ...base, ...(this.data || {}) };
+    for (const key of ['users', 'inventory_items', 'history', 'claimed_achievements', 'trades', 'trade_items']) {
+      if (!Array.isArray(this.data[key])) this.data[key] = [];
+    }
+    this.data.next_user_id = Math.max(Number(this.data.next_user_id) || 1, ...this.data.users.map(u => Number(u.id) + 1).filter(Boolean), 1);
+    this.data.next_history_id = Math.max(Number(this.data.next_history_id) || 1, ...this.data.history.map(h => Number(h.id) + 1).filter(Boolean), 1);
+  }
+
+  async save() {
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    const tmp = `${this.filePath}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(this.data, null, 2));
+    await fs.rename(tmp, this.filePath);
+  }
+
+  async read(fn) {
+    await this.init();
+    return fn(this.data);
+  }
+
+  async write(fn) {
+    await this.init();
+    const run = async () => {
+      const result = await fn(this.data);
+      await this.save();
+      return result;
+    };
+    const result = this.lock.then(run, run);
+    this.lock = result.catch(() => {});
+    return result;
+  }
+}
+
+const store = new JsonStore(DATA_FILE);
 let caseCache = { loadedAt: 0, data: [] };
 
 function sanitizeUsername(input) {
@@ -141,6 +210,10 @@ function newId() {
   return crypto.randomUUID();
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
 function getCasePrice(caseName) {
   return CASE_PRICE_OVERRIDES[caseName] ?? DEFAULT_CASE_PRICE;
 }
@@ -148,83 +221,6 @@ function getCasePrice(caseName) {
 function requireAuth(req, res, next) {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
   next();
-}
-
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      username TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      balance NUMERIC(12,2) NOT NULL DEFAULT 1000,
-      cases_opened INTEGER NOT NULL DEFAULT 0,
-      best_pull_value NUMERIC(12,2) NOT NULL DEFAULT 0,
-      best_pull_name TEXT,
-      best_pull_image TEXT,
-      best_pull_rarity TEXT,
-      best_rank INTEGER NOT NULL DEFAULT 0,
-      last_daily TIMESTAMPTZ,
-      last_job TIMESTAMPTZ,
-      trade_ups INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS inventory_items (
-      id UUID PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      source_id TEXT,
-      name TEXT NOT NULL,
-      base_name TEXT NOT NULL,
-      rarity TEXT NOT NULL,
-      case_name TEXT NOT NULL,
-      value NUMERIC(12,2) NOT NULL,
-      image TEXT NOT NULL,
-      is_stattrak BOOLEAN NOT NULL DEFAULT false,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS history (
-      id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      action TEXT NOT NULL,
-      name TEXT NOT NULL,
-      amount NUMERIC(12,2) NOT NULL DEFAULT 0,
-      rarity TEXT,
-      case_name TEXT,
-      image TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS claimed_achievements (
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      achievement_id TEXT NOT NULL,
-      claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (user_id, achievement_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS trades (
-      id UUID PRIMARY KEY,
-      from_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      to_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      from_money NUMERIC(12,2) NOT NULL DEFAULT 0,
-      to_money NUMERIC(12,2) NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS trade_items (
-      trade_id UUID NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
-      item_id UUID NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
-      side TEXT NOT NULL CHECK (side IN ('from', 'to')),
-      PRIMARY KEY (trade_id, item_id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_inventory_user ON inventory_items(user_id);
-    CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id);
-    CREATE INDEX IF NOT EXISTS idx_trades_from_user ON trades(from_user_id);
-    CREATE INDEX IF NOT EXISTS idx_trades_to_user ON trades(to_user_id);
-  `);
 }
 
 async function fetchFirstJson(urls) {
@@ -357,62 +353,64 @@ function rollItem(caseData) {
   const fullName = isStatTrak ? `StatTrak™ ${base.name}` : base.name;
   return {
     id: newId(),
+    source_id: base.sourceId,
     sourceId: base.sourceId,
     name: fullName,
+    base_name: base.name,
     baseName: base.name,
     rarity: base.rarity,
+    case_name: caseData.name,
     caseName: caseData.name,
     value: generateValue(base.rarity, isStatTrak),
     image: base.image,
-    isStatTrak
+    is_stattrak: isStatTrak,
+    isStatTrak,
+    created_at: nowIso()
   };
 }
 
-async function getUserSummary(userId) {
-  const { rows } = await pool.query(`
-    SELECT
-      u.id,
-      u.username,
-      u.balance,
-      u.cases_opened,
-      u.best_pull_value,
-      u.best_pull_name,
-      u.best_pull_image,
-      u.best_pull_rarity,
-      u.best_rank,
-      u.last_daily,
-      u.last_job,
-      u.trade_ups,
-      COALESCE(SUM(i.value), 0)::numeric(12,2) AS inventory_value,
-      COUNT(i.id)::int AS inventory_count
-    FROM users u
-    LEFT JOIN inventory_items i ON i.user_id = u.id
-    WHERE u.id = $1
-    GROUP BY u.id
-  `, [userId]);
-  return rows[0] || null;
+function findUserById(data, userId) {
+  return data.users.find(user => Number(user.id) === Number(userId)) || null;
 }
 
-async function getInventory(userId) {
-  const { rows } = await pool.query(`
-    SELECT id, source_id, name, base_name, rarity, case_name, value, image, is_stattrak, created_at
-    FROM inventory_items
-    WHERE user_id = $1
-    ORDER BY created_at DESC
-  `, [userId]);
-  return rows;
+function findUserByUsername(data, username) {
+  const lower = String(username || '').toLowerCase();
+  return data.users.find(user => String(user.username).toLowerCase() === lower) || null;
 }
 
-async function getClaims(userId) {
-  const { rows } = await pool.query('SELECT achievement_id FROM claimed_achievements WHERE user_id = $1', [userId]);
-  return new Set(rows.map(row => row.achievement_id));
+function getInventoryFromData(data, userId) {
+  return data.inventory_items
+    .filter(item => Number(item.user_id) === Number(userId))
+    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 }
 
-async function addHistory(client, userId, action, item) {
-  await client.query(`
-    INSERT INTO history (user_id, action, name, amount, rarity, case_name, image)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
-  `, [userId, action, item.name, item.amount ?? item.value ?? 0, item.rarity || 'milspec', item.caseName || item.case_name || 'System', item.image || '']);
+function getClaimsFromData(data, userId) {
+  return new Set(data.claimed_achievements
+    .filter(claim => Number(claim.user_id) === Number(userId))
+    .map(claim => claim.achievement_id));
+}
+
+function getUserSummaryFromData(data, userId) {
+  const user = findUserById(data, userId);
+  if (!user) return null;
+  const inventory = getInventoryFromData(data, userId);
+  const inventoryValue = inventory.reduce((sum, item) => sum + Number(item.value || 0), 0);
+  return {
+    id: user.id,
+    username: user.username,
+    balance: numberMoney(user.balance),
+    cases_opened: Number(user.cases_opened || 0),
+    best_pull_value: numberMoney(user.best_pull_value || 0),
+    best_pull_name: user.best_pull_name || null,
+    best_pull_image: user.best_pull_image || null,
+    best_pull_rarity: user.best_pull_rarity || null,
+    best_rank: Number(user.best_rank || 0),
+    last_daily: user.last_daily || null,
+    last_job: user.last_job || null,
+    trade_ups: Number(user.trade_ups || 0),
+    inventory_value: numberMoney(inventoryValue),
+    inventory_count: inventory.length
+  };
 }
 
 function publicUser(row) {
@@ -435,7 +433,31 @@ function publicUser(row) {
   };
 }
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+function addHistoryToData(data, userId, action, item) {
+  data.history.unshift({
+    id: data.next_history_id++,
+    user_id: userId,
+    action,
+    name: item.name,
+    amount: numberMoney(item.amount ?? item.value ?? 0),
+    rarity: item.rarity || 'milspec',
+    case_name: item.caseName || item.case_name || 'System',
+    image: item.image || '',
+    created_at: nowIso()
+  });
+  if (data.history.length > 5000) data.history = data.history.slice(0, 5000);
+}
+
+function isItemInPendingTrade(data, itemId) {
+  const pendingIds = new Set(data.trades.filter(t => t.status === 'pending').map(t => t.id));
+  return data.trade_items.some(ti => ti.item_id === itemId && pendingIds.has(ti.trade_id));
+}
+
+function trimString(value, max = 100) {
+  return String(value || '').slice(0, max);
+}
+
+app.get('/api/health', (req, res) => res.json({ ok: true, storage: 'json-file', dataFile: DATA_FILE }));
 
 app.post('/api/register', async (req, res) => {
   const username = sanitizeUsername(req.body.username);
@@ -445,14 +467,32 @@ app.post('/api/register', async (req, res) => {
 
   const hash = await bcrypt.hash(password, 10);
   try {
-    const { rows } = await pool.query(
-      'INSERT INTO users (username, password_hash, balance) VALUES ($1, $2, $3) RETURNING id',
-      [username, hash, START_BALANCE]
-    );
-    req.session.userId = rows[0].id;
-    res.json({ ok: true, user: publicUser(await getUserSummary(rows[0].id)) });
+    const result = await store.write(data => {
+      if (findUserByUsername(data, username)) return { conflict: true };
+      const user = {
+        id: data.next_user_id++,
+        username,
+        password_hash: hash,
+        balance: START_BALANCE,
+        cases_opened: 0,
+        best_pull_value: 0,
+        best_pull_name: null,
+        best_pull_image: null,
+        best_pull_rarity: null,
+        best_rank: 0,
+        last_daily: null,
+        last_job: null,
+        trade_ups: 0,
+        created_at: nowIso()
+      };
+      data.users.push(user);
+      return { user: publicUser(getUserSummaryFromData(data, user.id)) };
+    });
+
+    if (result.conflict) return res.status(409).json({ error: 'That username is already taken.' });
+    req.session.userId = result.user.id;
+    res.json({ ok: true, user: result.user });
   } catch (error) {
-    if (error.code === '23505') return res.status(409).json({ error: 'That username is already taken.' });
     console.error(error);
     res.status(500).json({ error: 'Could not register.' });
   }
@@ -461,11 +501,11 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   const username = sanitizeUsername(req.body.username);
   const password = String(req.body.password || '');
-  const { rows } = await pool.query('SELECT id, password_hash FROM users WHERE lower(username) = lower($1)', [username]);
-  const user = rows[0];
+  const user = await store.read(data => findUserByUsername(data, username));
   if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Invalid username or password.' });
   req.session.userId = user.id;
-  res.json({ ok: true, user: publicUser(await getUserSummary(user.id)) });
+  const summary = await store.read(data => publicUser(getUserSummaryFromData(data, user.id)));
+  res.json({ ok: true, user: summary });
 });
 
 app.post('/api/logout', requireAuth, (req, res) => {
@@ -473,7 +513,11 @@ app.post('/api/logout', requireAuth, (req, res) => {
 });
 
 app.get('/api/me', requireAuth, async (req, res) => {
-  res.json({ user: publicUser(await getUserSummary(req.session.userId)), inventory: await getInventory(req.session.userId) });
+  const payload = await store.read(data => ({
+    user: publicUser(getUserSummaryFromData(data, req.session.userId)),
+    inventory: getInventoryFromData(data, req.session.userId)
+  }));
+  res.json(payload);
 });
 
 app.get('/api/cases', async (req, res) => {
@@ -491,254 +535,220 @@ app.post('/api/open', requireAuth, async (req, res) => {
   const caseData = cases.find(c => c.id === caseId);
   if (!caseData) return res.status(404).json({ error: 'Case not found.' });
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const { rows: userRows } = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [req.session.userId]);
-    const user = userRows[0];
-    if (!user) throw new Error('User not found.');
-    if (Number(user.balance) < caseData.price) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Not enough fake balance.' });
-    }
+    const result = await store.write(data => {
+      const user = findUserById(data, req.session.userId);
+      if (!user) return { error: 401, message: 'User not found.' };
+      if (Number(user.balance) < Number(caseData.price)) return { error: 400, message: 'Not enough fake balance.' };
 
-    const won = rollItem(caseData);
-    const rarityRank = RARITY_MAP[won.rarity].rank;
-    const updateBest = Number(user.best_pull_value) < won.value;
+      const won = rollItem(caseData);
+      const rarityRank = RARITY_MAP[won.rarity].rank;
+      const updateBest = Number(user.best_pull_value || 0) < Number(won.value);
+      user.balance = numberMoney(Number(user.balance) - Number(caseData.price));
+      user.cases_opened = Number(user.cases_opened || 0) + 1;
+      if (updateBest) {
+        user.best_pull_value = won.value;
+        user.best_pull_name = won.name;
+        user.best_pull_image = won.image;
+        user.best_pull_rarity = won.rarity;
+      }
+      user.best_rank = Math.max(Number(user.best_rank || 0), rarityRank);
+      data.inventory_items.push({
+        id: won.id,
+        user_id: user.id,
+        source_id: won.sourceId,
+        name: won.name,
+        base_name: won.baseName,
+        rarity: won.rarity,
+        case_name: won.caseName,
+        value: won.value,
+        image: won.image,
+        is_stattrak: won.isStatTrak,
+        created_at: won.created_at
+      });
+      addHistoryToData(data, user.id, 'Opened', won);
+      return {
+        item: won,
+        user: publicUser(getUserSummaryFromData(data, user.id)),
+        inventory: getInventoryFromData(data, user.id)
+      };
+    });
 
-    await client.query(`
-      UPDATE users
-      SET balance = balance - $2,
-          cases_opened = cases_opened + 1,
-          best_pull_value = CASE WHEN $3 THEN $4 ELSE best_pull_value END,
-          best_pull_name = CASE WHEN $3 THEN $5 ELSE best_pull_name END,
-          best_pull_image = CASE WHEN $3 THEN $6 ELSE best_pull_image END,
-          best_pull_rarity = CASE WHEN $3 THEN $7 ELSE best_pull_rarity END,
-          best_rank = GREATEST(best_rank, $8)
-      WHERE id = $1
-    `, [req.session.userId, caseData.price, updateBest, won.value, won.name, won.image, won.rarity, rarityRank]);
-
-    await client.query(`
-      INSERT INTO inventory_items (id, user_id, source_id, name, base_name, rarity, case_name, value, image, is_stattrak)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-    `, [won.id, req.session.userId, won.sourceId, won.name, won.baseName, won.rarity, won.caseName, won.value, won.image, won.isStatTrak]);
-    await addHistory(client, req.session.userId, 'Opened', won);
-    await client.query('COMMIT');
-
-    res.json({ ok: true, item: won, user: publicUser(await getUserSummary(req.session.userId)), inventory: await getInventory(req.session.userId) });
+    if (result.error) return res.status(result.error).json({ error: result.message });
+    res.json({ ok: true, item: result.item, user: result.user, inventory: result.inventory });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Could not open case.' });
-  } finally {
-    client.release();
   }
 });
 
 app.post('/api/sell', requireAuth, async (req, res) => {
   const itemId = String(req.body.itemId || '');
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const { rows } = await client.query('SELECT * FROM inventory_items WHERE id = $1 AND user_id = $2 FOR UPDATE', [itemId, req.session.userId]);
-    const item = rows[0];
-    if (!item) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Item not found.' });
-    }
-
-    const { rows: tradeRows } = await client.query(`
-      SELECT 1 FROM trade_items ti JOIN trades t ON t.id = ti.trade_id
-      WHERE ti.item_id = $1 AND t.status = 'pending'
-      LIMIT 1
-    `, [itemId]);
-    if (tradeRows.length) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'This item is inside a pending trade.' });
-    }
-
-    await client.query('DELETE FROM inventory_items WHERE id = $1', [itemId]);
-    await client.query('UPDATE users SET balance = balance + $2 WHERE id = $1', [req.session.userId, item.value]);
-    await addHistory(client, req.session.userId, 'Sold', { ...item, amount: item.value, caseName: item.case_name });
-    await client.query('COMMIT');
-    res.json({ ok: true, user: publicUser(await getUserSummary(req.session.userId)), inventory: await getInventory(req.session.userId) });
+    const result = await store.write(data => {
+      const index = data.inventory_items.findIndex(item => item.id === itemId && Number(item.user_id) === Number(req.session.userId));
+      if (index === -1) return { error: 404, message: 'Item not found.' };
+      if (isItemInPendingTrade(data, itemId)) return { error: 400, message: 'This item is inside a pending trade.' };
+      const [item] = data.inventory_items.splice(index, 1);
+      const user = findUserById(data, req.session.userId);
+      user.balance = numberMoney(Number(user.balance) + Number(item.value));
+      addHistoryToData(data, user.id, 'Sold', { ...item, amount: item.value, caseName: item.case_name });
+      return { user: publicUser(getUserSummaryFromData(data, user.id)), inventory: getInventoryFromData(data, user.id) };
+    });
+    if (result.error) return res.status(result.error).json({ error: result.message });
+    res.json({ ok: true, user: result.user, inventory: result.inventory });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Could not sell item.' });
-  } finally {
-    client.release();
   }
 });
 
 app.post('/api/sell-all', requireAuth, async (req, res) => {
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const { rows } = await client.query(`
-      SELECT i.* FROM inventory_items i
-      WHERE i.user_id = $1
-        AND NOT EXISTS (
-          SELECT 1 FROM trade_items ti JOIN trades t ON t.id = ti.trade_id
-          WHERE ti.item_id = i.id AND t.status = 'pending'
-        )
-      FOR UPDATE
-    `, [req.session.userId]);
-    const total = rows.reduce((sum, item) => sum + Number(item.value), 0);
-    if (!rows.length) {
-      await client.query('ROLLBACK');
-      return res.json({ ok: true, sold: 0, total: 0, user: publicUser(await getUserSummary(req.session.userId)), inventory: await getInventory(req.session.userId) });
-    }
-    await client.query('DELETE FROM inventory_items WHERE id = ANY($1::uuid[])', [rows.map(item => item.id)]);
-    await client.query('UPDATE users SET balance = balance + $2 WHERE id = $1', [req.session.userId, total]);
-    await addHistory(client, req.session.userId, 'Sold inventory', { name: `${rows.length} items`, amount: total, rarity: 'milspec', caseName: 'Inventory', image: '' });
-    await client.query('COMMIT');
-    res.json({ ok: true, sold: rows.length, total, user: publicUser(await getUserSummary(req.session.userId)), inventory: await getInventory(req.session.userId) });
+    const result = await store.write(data => {
+      const items = data.inventory_items.filter(item => Number(item.user_id) === Number(req.session.userId) && !isItemInPendingTrade(data, item.id));
+      const total = numberMoney(items.reduce((sum, item) => sum + Number(item.value), 0));
+      if (!items.length) return { sold: 0, total: 0, user: publicUser(getUserSummaryFromData(data, req.session.userId)), inventory: getInventoryFromData(data, req.session.userId) };
+      const ids = new Set(items.map(item => item.id));
+      data.inventory_items = data.inventory_items.filter(item => !ids.has(item.id));
+      const user = findUserById(data, req.session.userId);
+      user.balance = numberMoney(Number(user.balance) + total);
+      addHistoryToData(data, user.id, 'Sold inventory', { name: `${items.length} items`, amount: total, rarity: 'milspec', caseName: 'Inventory', image: '' });
+      return { sold: items.length, total, user: publicUser(getUserSummaryFromData(data, user.id)), inventory: getInventoryFromData(data, user.id) };
+    });
+    res.json({ ok: true, ...result });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Could not sell inventory.' });
-  } finally {
-    client.release();
   }
 });
 
 app.post('/api/earn/daily', requireAuth, async (req, res) => {
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const { rows } = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [req.session.userId]);
-    const user = rows[0];
-    const last = user.last_daily ? new Date(user.last_daily).getTime() : 0;
-    if (Date.now() - last < DAILY_COOLDOWN_MS) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Daily bonus is not ready yet.' });
-    }
-    await client.query('UPDATE users SET balance = balance + $2, last_daily = NOW() WHERE id = $1', [req.session.userId, DAILY_REWARD]);
-    await addHistory(client, req.session.userId, 'Claimed', { name: 'Daily Supply Drop', amount: DAILY_REWARD, rarity: 'milspec', caseName: 'Earn', image: '' });
-    await client.query('COMMIT');
-    res.json({ ok: true, user: publicUser(await getUserSummary(req.session.userId)) });
+    const result = await store.write(data => {
+      const user = findUserById(data, req.session.userId);
+      const last = user.last_daily ? new Date(user.last_daily).getTime() : 0;
+      if (Date.now() - last < DAILY_COOLDOWN_MS) return { error: 400, message: 'Daily bonus is not ready yet.' };
+      user.balance = numberMoney(Number(user.balance) + DAILY_REWARD);
+      user.last_daily = nowIso();
+      addHistoryToData(data, user.id, 'Claimed', { name: 'Daily Supply Drop', amount: DAILY_REWARD, rarity: 'milspec', caseName: 'Earn', image: '' });
+      return { user: publicUser(getUserSummaryFromData(data, user.id)) };
+    });
+    if (result.error) return res.status(result.error).json({ error: result.message });
+    res.json({ ok: true, user: result.user });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Could not claim daily.' });
-  } finally {
-    client.release();
   }
 });
 
 app.post('/api/earn/job', requireAuth, async (req, res) => {
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const { rows } = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [req.session.userId]);
-    const user = rows[0];
-    const last = user.last_job ? new Date(user.last_job).getTime() : 0;
-    if (Date.now() - last < QUICK_JOB_COOLDOWN_MS) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Quick job is not ready yet.' });
-    }
-    await client.query('UPDATE users SET balance = balance + $2, last_job = NOW() WHERE id = $1', [req.session.userId, QUICK_JOB_REWARD]);
-    await addHistory(client, req.session.userId, 'Earned', { name: 'Quick Job', amount: QUICK_JOB_REWARD, rarity: 'milspec', caseName: 'Earn', image: '' });
-    await client.query('COMMIT');
-    res.json({ ok: true, user: publicUser(await getUserSummary(req.session.userId)) });
+    const result = await store.write(data => {
+      const user = findUserById(data, req.session.userId);
+      const last = user.last_job ? new Date(user.last_job).getTime() : 0;
+      if (Date.now() - last < QUICK_JOB_COOLDOWN_MS) return { error: 400, message: 'Quick job is not ready yet.' };
+      user.balance = numberMoney(Number(user.balance) + QUICK_JOB_REWARD);
+      user.last_job = nowIso();
+      addHistoryToData(data, user.id, 'Earned', { name: 'Quick Job', amount: QUICK_JOB_REWARD, rarity: 'milspec', caseName: 'Earn', image: '' });
+      return { user: publicUser(getUserSummaryFromData(data, user.id)) };
+    });
+    if (result.error) return res.status(result.error).json({ error: result.message });
+    res.json({ ok: true, user: result.user });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Could not do quick job.' });
-  } finally {
-    client.release();
   }
 });
 
 app.get('/api/achievements', requireAuth, async (req, res) => {
-  const summary = publicUser(await getUserSummary(req.session.userId));
-  const claimed = await getClaims(req.session.userId);
-  res.json({ achievements: ACHIEVEMENTS.map(a => ({ ...a, check: undefined, ready: a.check(summary), claimed: claimed.has(a.id) })) });
+  const payload = await store.read(data => {
+    const summary = publicUser(getUserSummaryFromData(data, req.session.userId));
+    const claimed = getClaimsFromData(data, req.session.userId);
+    return { achievements: ACHIEVEMENTS.map(a => ({ ...a, check: undefined, ready: a.check(summary), claimed: claimed.has(a.id) })) };
+  });
+  res.json(payload);
 });
 
 app.post('/api/achievements/:id/claim', requireAuth, async (req, res) => {
   const achievement = ACHIEVEMENTS.find(a => a.id === req.params.id);
   if (!achievement) return res.status(404).json({ error: 'Achievement not found.' });
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const summary = publicUser(await getUserSummary(req.session.userId));
-    if (!achievement.check(summary)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Achievement is not ready.' });
-    }
-    const { rowCount } = await client.query('INSERT INTO claimed_achievements (user_id, achievement_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.session.userId, achievement.id]);
-    if (!rowCount) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Achievement already claimed.' });
-    }
-    await client.query('UPDATE users SET balance = balance + $2 WHERE id = $1', [req.session.userId, achievement.reward]);
-    await addHistory(client, req.session.userId, 'Achievement', { name: achievement.title, amount: achievement.reward, rarity: 'special', caseName: 'Achievements', image: '' });
-    await client.query('COMMIT');
-    res.json({ ok: true, user: publicUser(await getUserSummary(req.session.userId)) });
+    const result = await store.write(data => {
+      const summary = publicUser(getUserSummaryFromData(data, req.session.userId));
+      if (!achievement.check(summary)) return { error: 400, message: 'Achievement is not ready.' };
+      const already = data.claimed_achievements.some(claim => Number(claim.user_id) === Number(req.session.userId) && claim.achievement_id === achievement.id);
+      if (already) return { error: 400, message: 'Achievement already claimed.' };
+      data.claimed_achievements.push({ user_id: req.session.userId, achievement_id: achievement.id, claimed_at: nowIso() });
+      const user = findUserById(data, req.session.userId);
+      user.balance = numberMoney(Number(user.balance) + achievement.reward);
+      addHistoryToData(data, user.id, 'Achievement', { name: achievement.title, amount: achievement.reward, rarity: 'special', caseName: 'Achievements', image: '' });
+      return { user: publicUser(getUserSummaryFromData(data, user.id)) };
+    });
+    if (result.error) return res.status(result.error).json({ error: result.message });
+    res.json({ ok: true, user: result.user });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Could not claim achievement.' });
-  } finally {
-    client.release();
   }
 });
 
 app.get('/api/history', requireAuth, async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100', [req.session.userId]);
-  res.json({ history: rows });
+  const history = await store.read(data => data.history
+    .filter(row => Number(row.user_id) === Number(req.session.userId))
+    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+    .slice(0, 100));
+  res.json({ history });
 });
 
 app.get('/api/users/search', requireAuth, async (req, res) => {
-  const q = String(req.query.q || '').trim();
+  const q = String(req.query.q || '').trim().toLowerCase();
   if (q.length < 1) return res.json({ users: [] });
-  const { rows } = await pool.query(`
-    SELECT id, username FROM users
-    WHERE id <> $1 AND lower(username) LIKE lower($2)
-    ORDER BY username ASC
-    LIMIT 12
-  `, [req.session.userId, `%${q}%`]);
-  res.json({ users: rows });
+  const users = await store.read(data => data.users
+    .filter(user => Number(user.id) !== Number(req.session.userId) && String(user.username).toLowerCase().includes(q))
+    .sort((a, b) => a.username.localeCompare(b.username))
+    .slice(0, 12)
+    .map(user => ({ id: user.id, username: user.username })));
+  res.json({ users });
 });
 
 app.get('/api/users/:username/inventory', requireAuth, async (req, res) => {
   const username = sanitizeUsername(req.params.username);
-  const { rows } = await pool.query('SELECT id, username FROM users WHERE lower(username) = lower($1)', [username]);
-  const user = rows[0];
-  if (!user) return res.status(404).json({ error: 'User not found.' });
-  res.json({ user, inventory: await getInventory(user.id) });
+  const payload = await store.read(data => {
+    const user = findUserByUsername(data, username);
+    if (!user) return null;
+    return { user: { id: user.id, username: user.username }, inventory: getInventoryFromData(data, user.id) };
+  });
+  if (!payload) return res.status(404).json({ error: 'User not found.' });
+  res.json(payload);
 });
 
 app.get('/api/leaderboard', async (req, res) => {
   const sort = String(req.query.sort || 'total');
-  const orderBy = {
-    total: 'total_value DESC',
-    balance: 'u.balance DESC',
-    inventory: 'inventory_value DESC',
-    cases: 'u.cases_opened DESC',
-    best: 'u.best_pull_value DESC'
-  }[sort] || 'total_value DESC';
-
-  const { rows } = await pool.query(`
-    SELECT
-      u.username,
-      u.balance,
-      u.cases_opened,
-      u.best_pull_value,
-      u.best_pull_name,
-      u.best_pull_image,
-      COALESCE(SUM(i.value), 0)::numeric(12,2) AS inventory_value,
-      (u.balance + COALESCE(SUM(i.value), 0))::numeric(12,2) AS total_value
-    FROM users u
-    LEFT JOIN inventory_items i ON i.user_id = u.id
-    GROUP BY u.id
-    ORDER BY ${orderBy}, u.username ASC
-    LIMIT 50
-  `);
-  res.json({ leaderboard: rows.map(row => ({ ...row, balance: Number(row.balance), inventory_value: Number(row.inventory_value), total_value: Number(row.total_value), best_pull_value: Number(row.best_pull_value) })) });
+  const leaderboard = await store.read(data => data.users.map(user => {
+    const summary = publicUser(getUserSummaryFromData(data, user.id));
+    return {
+      username: summary.username,
+      balance: summary.balance,
+      cases_opened: summary.cases_opened,
+      best_pull_value: summary.best_pull_value,
+      best_pull_name: summary.best_pull_name,
+      best_pull_image: summary.best_pull_image,
+      inventory_value: summary.inventory_value,
+      total_value: numberMoney(Number(summary.balance) + Number(summary.inventory_value))
+    };
+  }).sort((a, b) => {
+    const key = {
+      balance: 'balance',
+      inventory: 'inventory_value',
+      cases: 'cases_opened',
+      best: 'best_pull_value',
+      total: 'total_value'
+    }[sort] || 'total_value';
+    return Number(b[key] || 0) - Number(a[key] || 0) || a.username.localeCompare(b.username);
+  }).slice(0, 50));
+  res.json({ leaderboard });
 });
 
 app.post('/api/trades', requireAuth, async (req, res) => {
@@ -751,182 +761,146 @@ app.post('/api/trades', requireAuth, async (req, res) => {
   if (!toUsername) return res.status(400).json({ error: 'Choose a player to trade with.' });
   if (!fromItemIds.length && !toItemIds.length && fromMoney <= 0 && toMoney <= 0) return res.status(400).json({ error: 'Trade cannot be empty.' });
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const { rows: targetRows } = await client.query('SELECT id, username FROM users WHERE lower(username) = lower($1)', [toUsername]);
-    const target = targetRows[0];
-    if (!target) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Target user not found.' });
-    }
-    if (target.id === req.session.userId) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'You cannot trade with yourself.' });
-    }
+    const result = await store.write(data => {
+      const target = findUserByUsername(data, toUsername);
+      if (!target) return { error: 404, message: 'Target user not found.' };
+      if (Number(target.id) === Number(req.session.userId)) return { error: 400, message: 'You cannot trade with yourself.' };
+      const currentUser = findUserById(data, req.session.userId);
+      if (Number(currentUser.balance) < fromMoney) return { error: 400, message: 'You do not have enough fake balance for this offer.' };
 
-    const userIds = [req.session.userId, target.id].sort((a, b) => a - b);
-    const { rows: lockedUsers } = await client.query('SELECT id, balance FROM users WHERE id = ANY($1::int[]) ORDER BY id FOR UPDATE', [userIds]);
-    const currentUser = lockedUsers.find(u => u.id === req.session.userId);
-    if (Number(currentUser.balance) < fromMoney) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'You do not have enough fake balance for this offer.' });
-    }
-
-    const allItemIds = [...new Set([...fromItemIds, ...toItemIds])];
-    if (allItemIds.length) {
-      const { rows: activeTradeItems } = await client.query(`
-        SELECT ti.item_id FROM trade_items ti JOIN trades t ON t.id = ti.trade_id
-        WHERE ti.item_id = ANY($1::uuid[]) AND t.status = 'pending'
-      `, [allItemIds]);
-      if (activeTradeItems.length) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'One of those items is already inside a pending trade.' });
+      const allItemIds = [...new Set([...fromItemIds, ...toItemIds])];
+      for (const itemId of allItemIds) {
+        if (isItemInPendingTrade(data, itemId)) return { error: 400, message: 'One of those items is already inside a pending trade.' };
       }
 
-      const { rows: itemRows } = await client.query('SELECT id, user_id FROM inventory_items WHERE id = ANY($1::uuid[]) FOR UPDATE', [allItemIds]);
-      const byId = new Map(itemRows.map(item => [item.id, item]));
-      for (const id of fromItemIds) {
-        if (!byId.has(id) || byId.get(id).user_id !== req.session.userId) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: 'One of your offered items is no longer yours.' });
-        }
+      const byId = new Map(data.inventory_items.map(item => [item.id, item]));
+      for (const itemId of fromItemIds) {
+        const item = byId.get(itemId);
+        if (!item || Number(item.user_id) !== Number(req.session.userId)) return { error: 400, message: 'One of your offered items is no longer yours.' };
       }
-      for (const id of toItemIds) {
-        if (!byId.has(id) || byId.get(id).user_id !== target.id) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: 'One of the requested items is no longer owned by that player.' });
-        }
+      for (const itemId of toItemIds) {
+        const item = byId.get(itemId);
+        if (!item || Number(item.user_id) !== Number(target.id)) return { error: 400, message: 'One of the requested items is no longer owned by that player.' };
       }
-    }
 
-    const tradeId = newId();
-    await client.query(`
-      INSERT INTO trades (id, from_user_id, to_user_id, from_money, to_money)
-      VALUES ($1, $2, $3, $4, $5)
-    `, [tradeId, req.session.userId, target.id, fromMoney, toMoney]);
-    for (const itemId of fromItemIds) await client.query('INSERT INTO trade_items (trade_id, item_id, side) VALUES ($1, $2, $3)', [tradeId, itemId, 'from']);
-    for (const itemId of toItemIds) await client.query('INSERT INTO trade_items (trade_id, item_id, side) VALUES ($1, $2, $3)', [tradeId, itemId, 'to']);
-
-    await client.query('COMMIT');
-    res.json({ ok: true, tradeId });
+      const tradeId = newId();
+      data.trades.push({
+        id: tradeId,
+        from_user_id: req.session.userId,
+        to_user_id: target.id,
+        from_money: fromMoney,
+        to_money: toMoney,
+        status: 'pending',
+        created_at: nowIso(),
+        updated_at: nowIso()
+      });
+      for (const itemId of fromItemIds) data.trade_items.push({ trade_id: tradeId, item_id: itemId, side: 'from' });
+      for (const itemId of toItemIds) data.trade_items.push({ trade_id: tradeId, item_id: itemId, side: 'to' });
+      return { tradeId };
+    });
+    if (result.error) return res.status(result.error).json({ error: result.message });
+    res.json({ ok: true, tradeId: result.tradeId });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(error);
     res.status(500).json({ error: 'Could not create trade.' });
-  } finally {
-    client.release();
   }
 });
 
 app.get('/api/trades', requireAuth, async (req, res) => {
-  const { rows: tradeRows } = await pool.query(`
-    SELECT t.*, fu.username AS from_username, tu.username AS to_username
-    FROM trades t
-    JOIN users fu ON fu.id = t.from_user_id
-    JOIN users tu ON tu.id = t.to_user_id
-    WHERE t.from_user_id = $1 OR t.to_user_id = $1
-    ORDER BY t.created_at DESC
-    LIMIT 100
-  `, [req.session.userId]);
-
-  const trades = [];
-  for (const trade of tradeRows) {
-    const { rows: itemRows } = await pool.query(`
-      SELECT ti.side, i.id, i.name, i.rarity, i.case_name, i.value, i.image
-      FROM trade_items ti
-      JOIN inventory_items i ON i.id = ti.item_id
-      WHERE ti.trade_id = $1
-      ORDER BY ti.side, i.value DESC
-    `, [trade.id]);
-    trades.push({
-      id: trade.id,
-      fromUserId: trade.from_user_id,
-      toUserId: trade.to_user_id,
-      fromUsername: trade.from_username,
-      toUsername: trade.to_username,
-      fromMoney: Number(trade.from_money),
-      toMoney: Number(trade.to_money),
-      status: trade.status,
-      createdAt: trade.created_at,
-      itemsFrom: itemRows.filter(i => i.side === 'from'),
-      itemsTo: itemRows.filter(i => i.side === 'to'),
-      canAccept: trade.to_user_id === req.session.userId && trade.status === 'pending',
-      canCancel: (trade.to_user_id === req.session.userId || trade.from_user_id === req.session.userId) && trade.status === 'pending'
-    });
-  }
+  const trades = await store.read(data => data.trades
+    .filter(trade => Number(trade.from_user_id) === Number(req.session.userId) || Number(trade.to_user_id) === Number(req.session.userId))
+    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+    .slice(0, 100)
+    .map(trade => {
+      const fromUser = findUserById(data, trade.from_user_id);
+      const toUser = findUserById(data, trade.to_user_id);
+      const rows = data.trade_items
+        .filter(ti => ti.trade_id === trade.id)
+        .map(ti => {
+          const item = data.inventory_items.find(inv => inv.id === ti.item_id);
+          if (!item) return null;
+          return { side: ti.side, id: item.id, name: item.name, rarity: item.rarity, case_name: item.case_name, value: item.value, image: item.image };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.side.localeCompare(b.side) || Number(b.value) - Number(a.value));
+      return {
+        id: trade.id,
+        fromUserId: trade.from_user_id,
+        toUserId: trade.to_user_id,
+        fromUsername: fromUser?.username || 'Deleted User',
+        toUsername: toUser?.username || 'Deleted User',
+        fromMoney: Number(trade.from_money || 0),
+        toMoney: Number(trade.to_money || 0),
+        status: trade.status,
+        createdAt: trade.created_at,
+        itemsFrom: rows.filter(i => i.side === 'from'),
+        itemsTo: rows.filter(i => i.side === 'to'),
+        canAccept: Number(trade.to_user_id) === Number(req.session.userId) && trade.status === 'pending',
+        canCancel: (Number(trade.to_user_id) === Number(req.session.userId) || Number(trade.from_user_id) === Number(req.session.userId)) && trade.status === 'pending'
+      };
+    }));
   res.json({ trades });
 });
 
 app.post('/api/trades/:id/cancel', requireAuth, async (req, res) => {
   const tradeId = String(req.params.id || '');
-  const { rowCount } = await pool.query(`
-    UPDATE trades
-    SET status = 'cancelled', updated_at = NOW()
-    WHERE id = $1 AND status = 'pending' AND (from_user_id = $2 OR to_user_id = $2)
-  `, [tradeId, req.session.userId]);
-  if (!rowCount) return res.status(404).json({ error: 'Pending trade not found.' });
+  const result = await store.write(data => {
+    const trade = data.trades.find(t => t.id === tradeId && t.status === 'pending' && (Number(t.from_user_id) === Number(req.session.userId) || Number(t.to_user_id) === Number(req.session.userId)));
+    if (!trade) return { error: 404, message: 'Pending trade not found.' };
+    trade.status = 'cancelled';
+    trade.updated_at = nowIso();
+    return { ok: true };
+  });
+  if (result.error) return res.status(result.error).json({ error: result.message });
   res.json({ ok: true });
 });
 
 app.post('/api/trades/:id/accept', requireAuth, async (req, res) => {
   const tradeId = String(req.params.id || '');
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const { rows: tradeRows } = await client.query('SELECT * FROM trades WHERE id = $1 FOR UPDATE', [tradeId]);
-    const trade = tradeRows[0];
-    if (!trade || trade.status !== 'pending' || trade.to_user_id !== req.session.userId) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Pending incoming trade not found.' });
-    }
+    const result = await store.write(data => {
+      const trade = data.trades.find(t => t.id === tradeId);
+      if (!trade || trade.status !== 'pending' || Number(trade.to_user_id) !== Number(req.session.userId)) return { error: 404, message: 'Pending incoming trade not found.' };
+      const fromUser = findUserById(data, trade.from_user_id);
+      const toUser = findUserById(data, trade.to_user_id);
+      if (!fromUser || !toUser) return { error: 400, message: 'One of the users no longer exists.' };
+      if (Number(fromUser.balance) < Number(trade.from_money)) return { error: 400, message: 'Sender no longer has enough fake balance.' };
+      if (Number(toUser.balance) < Number(trade.to_money)) return { error: 400, message: 'You no longer have enough fake balance.' };
 
-    const userIds = [trade.from_user_id, trade.to_user_id].sort((a, b) => a - b);
-    const { rows: lockedUsers } = await client.query('SELECT id, balance FROM users WHERE id = ANY($1::int[]) ORDER BY id FOR UPDATE', [userIds]);
-    const fromUser = lockedUsers.find(u => u.id === trade.from_user_id);
-    const toUser = lockedUsers.find(u => u.id === trade.to_user_id);
-    if (Number(fromUser.balance) < Number(trade.from_money)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Sender no longer has enough fake balance.' });
-    }
-    if (Number(toUser.balance) < Number(trade.to_money)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'You no longer have enough fake balance.' });
-    }
-
-    const { rows: tradeItems } = await client.query(`
-      SELECT ti.side, i.id, i.user_id
-      FROM trade_items ti
-      JOIN inventory_items i ON i.id = ti.item_id
-      WHERE ti.trade_id = $1
-      FOR UPDATE OF i
-    `, [tradeId]);
-
-    const fromIds = [];
-    const toIds = [];
-    for (const item of tradeItems) {
-      if (item.side === 'from') {
-        if (item.user_id !== trade.from_user_id) throw new Error('Offered item ownership changed.');
-        fromIds.push(item.id);
-      } else {
-        if (item.user_id !== trade.to_user_id) throw new Error('Requested item ownership changed.');
-        toIds.push(item.id);
+      const tradeItems = data.trade_items.filter(ti => ti.trade_id === tradeId);
+      const byId = new Map(data.inventory_items.map(item => [item.id, item]));
+      const fromIds = [];
+      const toIds = [];
+      for (const entry of tradeItems) {
+        const item = byId.get(entry.item_id);
+        if (!item) return { error: 400, message: 'A trade item no longer exists.' };
+        if (entry.side === 'from') {
+          if (Number(item.user_id) !== Number(trade.from_user_id)) return { error: 400, message: 'Offered item ownership changed.' };
+          fromIds.push(item.id);
+        } else {
+          if (Number(item.user_id) !== Number(trade.to_user_id)) return { error: 400, message: 'Requested item ownership changed.' };
+          toIds.push(item.id);
+        }
       }
-    }
 
-    await client.query('UPDATE users SET balance = balance - $2 + $3 WHERE id = $1', [trade.from_user_id, trade.from_money, trade.to_money]);
-    await client.query('UPDATE users SET balance = balance - $2 + $3 WHERE id = $1', [trade.to_user_id, trade.to_money, trade.from_money]);
-    if (fromIds.length) await client.query('UPDATE inventory_items SET user_id = $2 WHERE id = ANY($1::uuid[])', [fromIds, trade.to_user_id]);
-    if (toIds.length) await client.query('UPDATE inventory_items SET user_id = $2 WHERE id = ANY($1::uuid[])', [toIds, trade.from_user_id]);
-    await client.query("UPDATE trades SET status = 'accepted', updated_at = NOW() WHERE id = $1", [tradeId]);
-    await client.query('COMMIT');
+      fromUser.balance = numberMoney(Number(fromUser.balance) - Number(trade.from_money) + Number(trade.to_money));
+      toUser.balance = numberMoney(Number(toUser.balance) - Number(trade.to_money) + Number(trade.from_money));
+      for (const item of data.inventory_items) {
+        if (fromIds.includes(item.id)) item.user_id = trade.to_user_id;
+        if (toIds.includes(item.id)) item.user_id = trade.from_user_id;
+      }
+      trade.status = 'accepted';
+      trade.updated_at = nowIso();
+      addHistoryToData(data, fromUser.id, 'Trade accepted', { name: `Trade with ${toUser.username}`, amount: 0, rarity: 'milspec', caseName: 'Trades', image: '' });
+      addHistoryToData(data, toUser.id, 'Trade accepted', { name: `Trade with ${fromUser.username}`, amount: 0, rarity: 'milspec', caseName: 'Trades', image: '' });
+      return { ok: true };
+    });
+    if (result.error) return res.status(result.error).json({ error: result.message });
     res.json({ ok: true });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(error);
     res.status(400).json({ error: error.message || 'Could not accept trade.' });
-  } finally {
-    client.release();
   }
 });
 
@@ -934,11 +908,14 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-initDb()
+store.init()
   .then(() => {
-    app.listen(PORT, () => console.log(`Crate Rush running on port ${PORT}`));
+    app.listen(PORT, () => {
+      console.log(`Crate Rush running on port ${PORT}`);
+      console.log(`Using JSON data file: ${DATA_FILE}`);
+    });
   })
   .catch(error => {
-    console.error('Failed to initialize database:', error);
+    console.error('Failed to initialize JSON storage:', error);
     process.exit(1);
   });
