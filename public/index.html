@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Crate Rush</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="authView" class="auth-shell hidden">
+    <section class="auth-card">
+      <div class="logo">▣</div>
+      <h1>Crate Rush</h1>
+      <p>Fake-money CS-style case opening. Accounts are only for saving progress, leaderboards, and trades.</p>
+      <form id="authForm" class="auth-form">
+        <input id="authUsername" autocomplete="username" placeholder="Username" maxlength="24" required />
+        <input id="authPassword" autocomplete="current-password" placeholder="Password" type="password" required />
+        <div class="auth-actions">
+          <button class="primary" type="submit" data-mode="login">Log In</button>
+          <button class="ghost" type="button" id="registerButton">Register</button>
+        </div>
+      </form>
+      <p class="note">No paid items, deposits, cashout, real item trading, or real-money gambling.</p>
+    </section>
+  </div>
+
+  <main id="appView" class="app hidden">
+    <header class="topbar">
+      <section class="brand">
+        <div class="logo">▣</div>
+        <div>
+          <h1>Crate Rush</h1>
+          <p class="subtitle">CS-style case opening with fake money only. Leaderboards and trades use simulator items only.</p>
+        </div>
+      </section>
+      <section class="stats">
+        <div class="stat"><small>Balance</small><strong id="balanceText">$0.00</strong></div>
+        <div class="stat"><small>Inventory</small><strong id="inventoryValueText">$0.00</strong></div>
+        <div class="stat"><small>Cases Opened</small><strong id="openedText">0</strong></div>
+        <div class="stat"><small>User</small><strong id="usernameText">-</strong></div>
+        <button class="ghost" id="logoutButton">Log Out</button>
+      </section>
+    </header>
+
+    <section class="layout">
+      <aside class="panel sidebar">
+        <div class="panel-header">
+          <h2>Cases</h2>
+          <button class="ghost" id="oddsButton">Odds</button>
+        </div>
+        <div class="panel-body">
+          <input id="caseSearchInput" class="wide" placeholder="Search cases..." />
+          <p id="caseDataText" class="note spacer">Loading cases...</p>
+          <div id="caseList" class="case-list"></div>
+        </div>
+      </aside>
+
+      <section class="main-stack">
+        <section class="panel opening-panel">
+          <div class="panel-header">
+            <div>
+              <h2 id="stageTitle">Open a Case</h2>
+              <p id="stageSubtext" class="note">Loading case data...</p>
+            </div>
+            <button id="openButton" class="primary">Open Selected Case</button>
+          </div>
+          <div class="panel-body">
+            <div class="ticker-wrap">
+              <div class="marker"></div>
+              <div id="ticker" class="ticker"></div>
+            </div>
+            <div id="resultBox" class="result-box"><div class="empty-result">Your next pull will appear here.</div></div>
+            <p id="soundNote" class="note spacer">Uses public/Case.mp3 when present.</p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header wrap">
+            <nav class="tabs">
+              <button class="tab active" data-tab="inventory">Inventory</button>
+              <button class="tab" data-tab="trading">Trading</button>
+              <button class="tab" data-tab="leaderboard">Leaderboard</button>
+              <button class="tab" data-tab="earn">Earn</button>
+              <button class="tab" data-tab="achievements">Achievements</button>
+              <button class="tab" data-tab="history">History</button>
+            </nav>
+          </div>
+
+          <div id="inventoryTab" class="panel-body tab-view">
+            <div class="toolbar">
+              <input id="inventorySearch" placeholder="Search inventory..." />
+              <select id="rarityFilter"><option value="all">All rarities</option></select>
+              <select id="sortSelect">
+                <option value="newest">Newest</option>
+                <option value="valueDesc">Value high to low</option>
+                <option value="valueAsc">Value low to high</option>
+                <option value="rarityDesc">Rarity best first</option>
+              </select>
+              <button id="sellAllButton" class="success">Sell All</button>
+            </div>
+            <div id="inventoryGrid" class="item-grid"></div>
+          </div>
+
+          <div id="tradingTab" class="panel-body tab-view hidden">
+            <section class="trade-layout">
+              <div class="trade-create card-soft">
+                <h3>Create Trade</h3>
+                <p class="note">Choose a player, offer your simulator items/money, and optionally request their items/money.</p>
+                <div class="toolbar stack-mobile">
+                  <input id="tradeUserSearch" placeholder="Search username..." />
+                  <button id="refreshTradesButton" class="ghost">Refresh Trades</button>
+                </div>
+                <div id="userSearchResults" class="pill-list"></div>
+                <div id="selectedTradeUser" class="selected-user">No player selected.</div>
+                <div class="money-row">
+                  <label>Offer fake money <input id="fromMoneyInput" type="number" min="0" step="0.01" value="0" /></label>
+                  <label>Request fake money <input id="toMoneyInput" type="number" min="0" step="0.01" value="0" /></label>
+                </div>
+                <div class="trade-columns">
+                  <div>
+                    <h4>Your Items</h4>
+                    <div id="tradeOwnItems" class="mini-item-list"></div>
+                  </div>
+                  <div>
+                    <h4>Their Items</h4>
+                    <div id="tradeTargetItems" class="mini-item-list"></div>
+                  </div>
+                </div>
+                <button id="createTradeButton" class="primary wide">Send Trade</button>
+              </div>
+
+              <div class="trade-list card-soft">
+                <h3>Your Trades</h3>
+                <div id="tradeList"></div>
+              </div>
+            </section>
+          </div>
+
+          <div id="leaderboardTab" class="panel-body tab-view hidden">
+            <div class="toolbar">
+              <select id="leaderboardSort">
+                <option value="total">Total value</option>
+                <option value="balance">Balance</option>
+                <option value="inventory">Inventory value</option>
+                <option value="cases">Cases opened</option>
+                <option value="best">Best pull</option>
+              </select>
+              <button id="refreshLeaderboardButton" class="ghost">Refresh</button>
+            </div>
+            <div id="leaderboardList" class="leaderboard-list"></div>
+          </div>
+
+          <div id="earnTab" class="panel-body tab-view hidden">
+            <div class="earn-grid">
+              <article class="card-soft"><h3>Daily Supply Drop</h3><p class="note">Free fake-money bonus once every 24 hours.</p><button id="dailyButton" class="success wide">Claim Daily</button></article>
+              <article class="card-soft"><h3>Quick Job</h3><p class="note">Reliable fake-money payout with a short cooldown.</p><button id="jobButton" class="primary wide">Do Job</button></article>
+            </div>
+          </div>
+
+          <div id="achievementsTab" class="panel-body tab-view hidden"><div id="achievementList" class="achievement-list"></div></div>
+          <div id="historyTab" class="panel-body tab-view hidden"><div id="historyList" class="history-list"></div></div>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <section id="oddsModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="panel-header"><div><h2>Case Odds</h2><p class="note">Server-side rolls use these official-style rarity odds.</p></div><button id="closeOddsButton" class="ghost">Close</button></div>
+      <div id="oddsGrid" class="panel-body odds-grid"></div>
+    </div>
+  </section>
+
+  <div id="toastWrap" class="toast-wrap"></div>
+  <script src="app.js"></script>
+</body>
+</html>
