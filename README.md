@@ -71,11 +71,17 @@ http://localhost:3000
 The frontend looks for:
 
 ```txt
-public/Case.mp3
+public/csgo_ui_crate_item_scroll.wav
 ```
 
-A provided `Case.mp3` is included in this project if you generated the zip from ChatGPT with the uploaded audio.
+A provided `csgo_ui_crate_item_scroll.wav` is included in this project if you generated the zip from ChatGPT with the uploaded audio.
 
 ## Notes
 
 File-based JSON storage is simple and fine for a small project. PostgreSQL is still better for a large public site with lots of concurrent users, but this version avoids needing a database service.
+
+
+## Latest changes
+
+- Added selected-case raised styling without the old clipping bug.
+- Added stronger item reveal animations after case openings.

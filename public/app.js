@@ -29,17 +29,78 @@ const els = {
   oddsButton: $('oddsButton'), oddsModal: $('oddsModal'), closeOddsButton: $('closeOddsButton'), oddsGrid: $('oddsGrid'), toastWrap: $('toastWrap')
 };
 
-const audio = {
-  last: 0,
-  play() {
-    const now = performance.now();
-    if (now - this.last < 500) return;
-    this.last = now;
-    const sound = new Audio('Case.mp3');
-    sound.volume = 0.65;
-    sound.play().catch(() => {});
-  }
-};
+const TICK_SOUND_FILE = 'csgo_ui_crate_item_scroll.wav';
+
+const audio = createCaseTickAudio();
+
+function createCaseTickAudio() {
+  const poolSize = 16;
+  const pool = Array.from({ length: poolSize }, () => {
+    const sound = new Audio(TICK_SOUND_FILE);
+    sound.preload = 'auto';
+    sound.volume = 0.48;
+    return sound;
+  });
+
+  let poolIndex = 0;
+  let scheduledTicks = [];
+
+  return {
+    prepare() {
+      for (const sound of pool) {
+        sound.load();
+      }
+    },
+
+    clearScheduledTicks() {
+      for (const timer of scheduledTicks) clearTimeout(timer);
+      scheduledTicks = [];
+    },
+
+    scheduleTick(delayMs) {
+      const timer = setTimeout(() => this.playTick(), Math.max(0, delayMs));
+      scheduledTicks.push(timer);
+    },
+
+    scheduleReelTicks({ targetTranslate, step, wrapWidth }) {
+      this.clearScheduledTicks();
+
+      const reelDistance = -targetTranslate;
+      if (reelDistance <= 0 || step <= 0) return;
+
+      const startMarker = wrapWidth / 2;
+      const endMarker = startMarker + reelDistance;
+      const firstBoundaryIndex = Math.floor(startMarker / step) + 1;
+      const lastBoundaryIndex = Math.min(Math.floor(endMarker / step), REEL_LENGTH - 1);
+
+      for (let index = firstBoundaryIndex; index <= lastBoundaryIndex; index++) {
+        const boundaryPosition = index * step;
+        const easedProgress = (boundaryPosition - startMarker) / reelDistance;
+        if (easedProgress <= 0 || easedProgress >= 1) continue;
+
+        // Inverse of easeOutQuint: eased = 1 - (1 - progress)^5
+        const rawProgress = 1 - Math.pow(1 - easedProgress, 1 / 5);
+        const delay = rawProgress * ROLL_DURATION_MS;
+        this.scheduleTick(delay);
+      }
+    },
+
+    playTick() {
+      const sound = pool[poolIndex];
+      poolIndex = (poolIndex + 1) % pool.length;
+
+      try {
+        sound.pause();
+        sound.currentTime = 0;
+        sound.play().catch(() => {});
+      } catch {
+        const fallback = new Audio(TICK_SOUND_FILE);
+        fallback.volume = 0.48;
+        fallback.play().catch(() => {});
+      }
+    }
+  };
+}
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -174,7 +235,7 @@ function renderCases() {
     return;
   }
   els.caseList.innerHTML = cases.map(c => `
-    <article class="case-card">
+    <article class="case-card ${c.id === state.selectedCaseId ? 'selected' : ''}" style="--caseGlow:${c.id === state.selectedCaseId ? 'rgba(255,255,255,.11)' : 'rgba(255,255,255,.055)'}">
       <div class="case-top">
         <div class="case-icon"><img src="${escapeHtml(c.image)}" alt="${escapeHtml(c.name)}" loading="lazy"></div>
         <div class="case-info">
@@ -294,7 +355,7 @@ async function openCase() {
   try {
     state.rolling = true;
     renderStage();
-    audio.play();
+    audio.prepare();
     const data = await api('/api/open', { method: 'POST', body: JSON.stringify({ caseId: caseData.id }) });
     renderReel(caseData, data.item);
     state.user = data.user;
@@ -304,6 +365,7 @@ async function openCase() {
     requestAnimationFrame(() => animateReel(caseData, data.item));
   } catch (error) {
     state.rolling = false;
+    audio.clearScheduledTicks();
     renderStage();
     toast('Could not open case', error.message);
   }
@@ -318,6 +380,7 @@ function animateReel(caseData, item) {
   const nudge = Math.round((Math.random() - 0.5) * (cardWidth * 0.28));
   const targetTranslate = wrap.clientWidth / 2 - targetCenter + nudge;
   const start = performance.now();
+  audio.scheduleReelTicks({ targetTranslate, step, wrapWidth: wrap.clientWidth });
 
   function frame(now) {
     const progress = Math.min(1, (now - start) / ROLL_DURATION_MS);
@@ -331,24 +394,78 @@ function animateReel(caseData, item) {
 
 function finishOpen(item) {
   state.rolling = false;
+  audio.clearScheduledTicks();
   renderStage();
   renderResult(item);
   refreshAll();
+  showDropReveal(item);
   toast('Item unboxed', `${item.name} • ${rarityLabel(item.rarity)} • ${money(item.value)}`);
+}
+
+function showDropReveal(item) {
+  const rarity = state.rarityMap[item.rarity] || {};
+  const rarityRank = Number(rarity.rank || 1);
+  const backdrop = document.createElement('div');
+  backdrop.className = `drop-reveal rank-${rarityRank}`;
+  backdrop.style.cssText = rarityVars(item.rarity);
+
+  const sparks = Array.from({ length: rarityRank >= 4 ? 24 : 14 }, (_, i) => {
+    const angle = Math.round((360 / (rarityRank >= 4 ? 24 : 14)) * i);
+    const distance = 110 + Math.round(Math.random() * 90);
+    const delay = Math.round(Math.random() * 180);
+    return `<span class="spark" style="--angle:${angle}deg;--distance:${distance}px;--delay:${delay}ms"></span>`;
+  }).join('');
+
+  backdrop.innerHTML = `
+    <div class="drop-card">
+      <div class="drop-rays"></div>
+      <div class="spark-layer">${sparks}</div>
+      <div class="drop-art"><img src="${escapeHtml(item.image)}" alt="${escapeHtml(item.name)}"></div>
+      <div class="drop-copy">
+        <span class="drop-label">You unboxed</span>
+        <h2>${escapeHtml(item.name)}</h2>
+        <div class="rarity-pill" style="${rarityVars(item.rarity)}">${escapeHtml(rarity.label || item.rarity)}</div>
+        <p>${money(item.value)} fake sell value</p>
+      </div>
+      <button class="ghost drop-close" type="button">Continue</button>
+    </div>
+  `;
+
+  document.body.appendChild(backdrop);
+  requestAnimationFrame(() => backdrop.classList.add('show'));
+
+  const close = () => {
+    backdrop.classList.add('closing');
+    setTimeout(() => backdrop.remove(), 260);
+  };
+
+  backdrop.querySelector('.drop-close').addEventListener('click', close);
+  backdrop.addEventListener('click', event => {
+    if (event.target === backdrop) close();
+  });
+  setTimeout(close, rarityRank >= 4 ? 6200 : 4700);
 }
 
 function renderResult(item) {
   const rarity = state.rarityMap[item.rarity];
+  const rank = Number(rarity?.rank || 1);
+  els.resultBox.className = `result-box result-rank-${rank}`;
+  els.resultBox.style.cssText = rarityVars(item.rarity);
   els.resultBox.innerHTML = `
-    <div class="result-art" style="${rarityVars(item.rarity)}"><img src="${escapeHtml(item.image)}" alt="${escapeHtml(item.name)}"></div>
+    <div class="result-art"><img src="${escapeHtml(item.image)}" alt="${escapeHtml(item.name)}"></div>
     <div class="result-details">
+      <span class="result-kicker">New item added to inventory</span>
       <h2>${escapeHtml(item.name)}</h2>
       <div class="rarity-pill" style="${rarityVars(item.rarity)}">${escapeHtml(rarity?.label || item.rarity)}</div>
       <p class="value-line">Fake sell value: <strong>${money(item.value)}</strong><br>${escapeHtml(item.caseName)}</p>
     </div>
-    <button class="success" data-sell-item="${item.id}">Sell Now</button>
+    <div class="result-actions">
+      <button class="success" data-sell-item="${item.id}">Sell Now</button>
+      <button class="ghost" data-keep-item>Keep</button>
+    </div>
   `;
   els.resultBox.querySelector('[data-sell-item]').addEventListener('click', () => sellItem(item.id));
+  els.resultBox.querySelector('[data-keep-item]').addEventListener('click', () => toast('Kept', 'Item stayed in your inventory.'));
 }
 
 async function sellItem(itemId) {
