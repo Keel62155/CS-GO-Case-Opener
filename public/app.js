@@ -29,9 +29,9 @@ const els = {
   oddsButton: $('oddsButton'), oddsModal: $('oddsModal'), closeOddsButton: $('closeOddsButton'), oddsGrid: $('oddsGrid'), toastWrap: $('toastWrap')
 };
 
-const START_SOUND_FILE = 'case_unlock_01.wav';
+const START_SOUND_FILE = 'Case Unlock.mp3';
 const TICK_SOUND_FILE = 'csgo_ui_crate_item_scroll.wav';
-const START_SOUND_FALLBACK_DURATION_MS = 4213;
+const START_SOUND_FALLBACK_DURATION_MS = 3196;
 const REVEAL_SOUND_FILES = {
   milspec: 'case_reveal_rare_01.wav',
   restricted: 'case_reveal_mythical_01.wav',
