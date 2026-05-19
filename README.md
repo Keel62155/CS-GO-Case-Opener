@@ -85,24 +85,13 @@ File-based JSON storage is simple and fine for a small project. PostgreSQL is st
 
 - Added selected-case raised styling without the old clipping bug.
 - Added stronger item reveal animations after case openings.
-- Changed the unlock sound so it fully plays before the reel animation starts.
 
 
 ## Audio files
 
-- `public/Case Unlock.mp3` plays first before the item reel begins
-
-This build includes `public/Case Unlock.mp3` for the pre-reel unlock sound, `public/csgo_ui_crate_item_scroll.wav` for each reel tick, and these reveal sounds:
+This build includes `public/csgo_ui_crate_item_scroll.wav` for each reel tick and these reveal sounds:
 
 - `public/case_reveal_rare_01.wav` for Mil-Spec items
 - `public/case_reveal_mythical_01.wav` for Restricted items
 - `public/case_reveal_legendary_01.wav` for Classified items
 - `public/case_reveal_ancient_01.wav` for Covert and Special items
-
-
-## Recent changes
-
-### v1.7.0
-
-- Replaced the pre-reel unlock sound with `public/Case Unlock.mp3`.
-- Updated the intro fallback timing to match the new MP3 duration, about 3.196 seconds.

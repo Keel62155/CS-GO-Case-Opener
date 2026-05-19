@@ -29,9 +29,7 @@ const els = {
   oddsButton: $('oddsButton'), oddsModal: $('oddsModal'), closeOddsButton: $('closeOddsButton'), oddsGrid: $('oddsGrid'), toastWrap: $('toastWrap')
 };
 
-const START_SOUND_FILE = 'Case Unlock.mp3';
 const TICK_SOUND_FILE = 'csgo_ui_crate_item_scroll.wav';
-const START_SOUND_FALLBACK_DURATION_MS = 3196;
 const REVEAL_SOUND_FILES = {
   milspec: 'case_reveal_rare_01.wav',
   restricted: 'case_reveal_mythical_01.wav',
@@ -43,10 +41,6 @@ const REVEAL_SOUND_FILES = {
 const audio = createAudioController();
 
 function createAudioController() {
-  const startSound = new Audio(START_SOUND_FILE);
-  startSound.preload = 'auto';
-  startSound.volume = 0.74;
-
   const tickPoolSize = 16;
   const tickPool = Array.from({ length: tickPoolSize }, () => {
     const sound = new Audio(TICK_SOUND_FILE);
@@ -67,54 +61,8 @@ function createAudioController() {
 
   return {
     prepare() {
-      startSound.load();
       for (const sound of tickPool) sound.load();
       for (const sound of Object.values(revealSounds)) sound.load();
-    },
-
-    playStartIntro() {
-      return new Promise(resolve => {
-        let finished = false;
-        let sound;
-        let timeout;
-
-        const finish = () => {
-          if (finished) return;
-          finished = true;
-          if (timeout) clearTimeout(timeout);
-          if (sound) {
-            sound.onended = null;
-            sound.onerror = null;
-          }
-          resolve();
-        };
-
-        try {
-          sound = startSound.cloneNode(true);
-          sound.volume = startSound.volume;
-          sound.currentTime = 0;
-          sound.onended = finish;
-          sound.onerror = finish;
-
-          const knownDuration = Number.isFinite(startSound.duration) && startSound.duration > 0
-            ? startSound.duration * 1000
-            : START_SOUND_FALLBACK_DURATION_MS;
-          timeout = setTimeout(finish, knownDuration + 160);
-
-          const playPromise = sound.play();
-          if (playPromise && typeof playPromise.catch === 'function') {
-            playPromise.catch(finish);
-          }
-        } catch {
-          const fallback = new Audio(START_SOUND_FILE);
-          fallback.volume = 0.74;
-          fallback.onended = finish;
-          fallback.onerror = finish;
-          timeout = setTimeout(finish, START_SOUND_FALLBACK_DURATION_MS + 160);
-          fallback.play().catch(finish);
-          sound = fallback;
-        }
-      });
     },
 
     clearScheduledTicks() {
@@ -436,16 +384,7 @@ async function openCase() {
     state.rolling = true;
     renderStage();
     audio.prepare();
-
-    // Play the unlock sound first, then start the item reel immediately after it ends.
-    // The server roll is requested during the unlock sound so there is no extra gap.
-    const rollPromise = api('/api/open', { method: 'POST', body: JSON.stringify({ caseId: caseData.id }) });
-    const introPromise = audio.playStartIntro();
-    const [rollResult] = await Promise.allSettled([rollPromise, introPromise]);
-
-    if (rollResult.status === 'rejected') throw rollResult.reason;
-
-    const data = rollResult.value;
+    const data = await api('/api/open', { method: 'POST', body: JSON.stringify({ caseId: caseData.id }) });
     renderReel(caseData, data.item);
     state.user = data.user;
     state.inventory = data.inventory || state.inventory;
