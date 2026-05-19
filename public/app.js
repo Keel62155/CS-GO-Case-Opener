@@ -30,26 +30,39 @@ const els = {
 };
 
 const TICK_SOUND_FILE = 'csgo_ui_crate_item_scroll.wav';
+const REVEAL_SOUND_FILES = {
+  milspec: 'case_reveal_rare_01.wav',
+  restricted: 'case_reveal_mythical_01.wav',
+  classified: 'case_reveal_legendary_01.wav',
+  covert: 'case_reveal_ancient_01.wav',
+  special: 'case_reveal_ancient_01.wav'
+};
 
-const audio = createCaseTickAudio();
+const audio = createAudioController();
 
-function createCaseTickAudio() {
-  const poolSize = 16;
-  const pool = Array.from({ length: poolSize }, () => {
+function createAudioController() {
+  const tickPoolSize = 16;
+  const tickPool = Array.from({ length: tickPoolSize }, () => {
     const sound = new Audio(TICK_SOUND_FILE);
     sound.preload = 'auto';
     sound.volume = 0.48;
     return sound;
   });
 
-  let poolIndex = 0;
+  const revealSounds = Object.fromEntries(Object.entries(REVEAL_SOUND_FILES).map(([rarity, src]) => {
+    const sound = new Audio(src);
+    sound.preload = 'auto';
+    sound.volume = rarity === 'special' || rarity === 'covert' ? 0.84 : 0.74;
+    return [rarity, sound];
+  }));
+
+  let tickPoolIndex = 0;
   let scheduledTicks = [];
 
   return {
     prepare() {
-      for (const sound of pool) {
-        sound.load();
-      }
+      for (const sound of tickPool) sound.load();
+      for (const sound of Object.values(revealSounds)) sound.load();
     },
 
     clearScheduledTicks() {
@@ -86,8 +99,8 @@ function createCaseTickAudio() {
     },
 
     playTick() {
-      const sound = pool[poolIndex];
-      poolIndex = (poolIndex + 1) % pool.length;
+      const sound = tickPool[tickPoolIndex];
+      tickPoolIndex = (tickPoolIndex + 1) % tickPool.length;
 
       try {
         sound.pause();
@@ -96,6 +109,21 @@ function createCaseTickAudio() {
       } catch {
         const fallback = new Audio(TICK_SOUND_FILE);
         fallback.volume = 0.48;
+        fallback.play().catch(() => {});
+      }
+    },
+
+    playReveal(rarityId) {
+      const src = REVEAL_SOUND_FILES[rarityId] || REVEAL_SOUND_FILES.milspec;
+      const base = revealSounds[rarityId] || revealSounds.milspec;
+
+      try {
+        const sound = base.cloneNode(true);
+        sound.volume = base.volume;
+        sound.play().catch(() => {});
+      } catch {
+        const fallback = new Audio(src);
+        fallback.volume = rarityId === 'special' || rarityId === 'covert' ? 0.84 : 0.74;
         fallback.play().catch(() => {});
       }
     }
@@ -398,6 +426,7 @@ function finishOpen(item) {
   renderStage();
   renderResult(item);
   refreshAll();
+  audio.playReveal(item.rarity);
   showDropReveal(item);
   toast('Item unboxed', `${item.name} • ${rarityLabel(item.rarity)} • ${money(item.value)}`);
 }

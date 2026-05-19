@@ -85,3 +85,13 @@ File-based JSON storage is simple and fine for a small project. PostgreSQL is st
 
 - Added selected-case raised styling without the old clipping bug.
 - Added stronger item reveal animations after case openings.
+
+
+## Audio files
+
+This build includes `public/csgo_ui_crate_item_scroll.wav` for each reel tick and these reveal sounds:
+
+- `public/case_reveal_rare_01.wav` for Mil-Spec items
+- `public/case_reveal_mythical_01.wav` for Restricted items
+- `public/case_reveal_legendary_01.wav` for Classified items
+- `public/case_reveal_ancient_01.wav` for Covert and Special items
