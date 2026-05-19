@@ -29,6 +29,7 @@ const els = {
   oddsButton: $('oddsButton'), oddsModal: $('oddsModal'), closeOddsButton: $('closeOddsButton'), oddsGrid: $('oddsGrid'), toastWrap: $('toastWrap')
 };
 
+const START_SOUND_FILE = 'case_unlock_01.wav';
 const TICK_SOUND_FILE = 'csgo_ui_crate_item_scroll.wav';
 const REVEAL_SOUND_FILES = {
   milspec: 'case_reveal_rare_01.wav',
@@ -41,6 +42,10 @@ const REVEAL_SOUND_FILES = {
 const audio = createAudioController();
 
 function createAudioController() {
+  const startSound = new Audio(START_SOUND_FILE);
+  startSound.preload = 'auto';
+  startSound.volume = 0.74;
+
   const tickPoolSize = 16;
   const tickPool = Array.from({ length: tickPoolSize }, () => {
     const sound = new Audio(TICK_SOUND_FILE);
@@ -61,8 +66,21 @@ function createAudioController() {
 
   return {
     prepare() {
+      startSound.load();
       for (const sound of tickPool) sound.load();
       for (const sound of Object.values(revealSounds)) sound.load();
+    },
+
+    playStart() {
+      try {
+        startSound.pause();
+        startSound.currentTime = 0;
+        startSound.play().catch(() => {});
+      } catch {
+        const fallback = new Audio(START_SOUND_FILE);
+        fallback.volume = 0.74;
+        fallback.play().catch(() => {});
+      }
     },
 
     clearScheduledTicks() {
@@ -384,6 +402,7 @@ async function openCase() {
     state.rolling = true;
     renderStage();
     audio.prepare();
+    audio.playStart();
     const data = await api('/api/open', { method: 'POST', body: JSON.stringify({ caseId: caseData.id }) });
     renderReel(caseData, data.item);
     state.user = data.user;
